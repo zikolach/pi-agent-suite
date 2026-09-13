@@ -11,6 +11,22 @@
 
 Start and steer return after the child accepts the prompt. They do not wait for the child invocation to finish.
 
+## Delegation guidance
+
+The bundled model guidance applies these defaults:
+
+- Work directly for routine repository operations, focused searches, and small clear patches.
+- One child is valid and preferred when one specialist is sufficient.
+- Use parallel children only for independent tasks when parallel execution materially helps.
+- Create a dependency map only for a parallel batch and use at most three children in that batch by default.
+- Do not run code-changing children in parallel against the same project.
+- Use `subagent_steer` only for direct continuation of one atomic task. Use `subagent_start` for independent work or a different specialist.
+- Use `subagent_wait` only when the parent cannot proceed without terminal feedback.
+- Write child prompts and requested responses in ASD-STE100 Simplified Technical English.
+- Verify required child output in the parent session before relying on it to complete the task.
+
+Configured description files replace the corresponding bundled guidance.
+
 ## Configuration
 
 Default file: `~/.pi/agent/agent-suite/run-subagent/config.json`.

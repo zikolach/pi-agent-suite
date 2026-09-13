@@ -1,10 +1,12 @@
-DESCRIPTION: Send a prompt to previously started subagent session.
+DESCRIPTION: Send a follow-up prompt to a previously started child session.
 
 USAGE:
-1. Active session accepts steering in its current invocation.
-2. Terminal session continues through new invocation of same session.
-3. Can be used not only for steering, but also for discussion with subagents, obtaining additional opinions, etc.
-4. Prompt MUST be written in ASD-STE100 - Simplified Technical English.
+1. A single continuation call is valid.
+2. Use `subagent_steer` only to adjust an active invocation or continue a terminal session within the same atomic task.
+3. Include only changed requirements, decisions, findings, acceptance criteria, or evidence needed for the continuation.
+4. Use `subagent_start` for an independent task or a different specialist.
+5. Write the follow-up prompt in ASD-STE100 Simplified Technical English.
 
-CONSTRAINTS: MUST NOT be used to solve multiple subtasks in one session. Steering should be used to clarify and adjust ONE ATOMIC subtask.
-
+CONSTRAINTS:
+1. Do not reuse one session for multiple subtasks.
+2. Do not steer a running child merely to request status or push it to finish. Use automatically delivered feedback or `subagent_wait`.
