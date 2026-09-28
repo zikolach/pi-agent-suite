@@ -23,6 +23,8 @@ import {
 	type PackagePresentationEventBus,
 	registerPackageTool,
 } from "../../shared/tool-presentation/registry";
+import { publishUsageEntry } from "../../shared/usage-events";
+import { requestUsageSessionTotals } from "../../shared/usage-read-broker";
 import type { AgentOperationResponse } from "./agent-operation-wire";
 import {
 	applyChildToolPolicy,
@@ -857,6 +859,7 @@ function createRootSupervisor(options: {
 		bridge: options.bridge,
 		childStartupConfig: options.childStartupConfig,
 		recordChildStartupAttempt: options.recordChildStartupAttempt,
+		rootSessionId: options.ctx.sessionManager.getSessionId(),
 		sessionsDir: projectSessionDirectory(
 			join(getSuiteExtensionDir(SUBAGENTS_EXTENSION_DIR), "sessions"),
 			options.ctx.cwd,
@@ -870,6 +873,7 @@ function createRootSupervisor(options: {
 				request,
 			}),
 		onEvent: (event) => options.getCoordinator().observeInvocation(event),
+		onUsageEntry: (usage) => publishUsageEntry(options.pi, usage),
 		onRuntimeFailure: (failure) => {
 			cancelKnowledgeRuntimeOwner(options.pi, failure.runtimeLeaseId);
 			return startRuntimeFailureRecovery({
@@ -980,6 +984,8 @@ function createRootManagementRuntime(options: {
 		submission,
 		retained,
 		showCacheHitRate: options.showCacheHitRate,
+		readSessionTotals: (sessionId) =>
+			requestUsageSessionTotals(options.pi, sessionId),
 	});
 	return {
 		projection,

@@ -29,6 +29,7 @@ import {
 	doesAuxiliaryLlmInputFitContextWindow,
 	getAuxiliaryLlmResponseText,
 	resolveAuxiliaryLlmRuntime,
+	withoutSystemMessages,
 } from "../../shared/auxiliary-llm";
 import {
 	collectLoadedSkillRoots,
@@ -62,6 +63,7 @@ import {
 	validateRetryConfig,
 	withRetry,
 } from "../../shared/retry";
+import { publishUsageEvent } from "../../shared/usage-events";
 import {
 	AskAnswerDialog,
 	AskLoadingDialog,
@@ -366,6 +368,7 @@ async function executeAskLlm({
 	if ("issue" in response) {
 		return { kind: "issue", issue: response.issue };
 	}
+	publishUsageEvent(pi, "ask-llm", response);
 	if (signal?.aborted === true || response.stopReason === "aborted") {
 		return { kind: "cancelled" };
 	}
@@ -405,7 +408,7 @@ async function buildContext({
 		cwd: ctx.cwd,
 		loadedSkillRoots,
 	});
-	const messages = convertToLlm(projectedMessages);
+	const messages = convertToLlm(withoutSystemMessages(projectedMessages));
 	messages.push({
 		role: "user",
 		content: formatUserQuestion(question),

@@ -25,10 +25,12 @@ import {
 	SUBAGENT_AGENT_ID_ENV,
 	SUBAGENT_DEPTH_ENV,
 	SUBAGENT_OWNER_SESSION_ENV,
+	SUBAGENT_ROOT_SESSION_ID_ENV,
 	SUBAGENT_RUNTIME_LEASE_ENV,
 	SUBAGENT_TOOL_PATTERNS_ENV,
 	SUBAGENT_WORKFLOW_IDS_ENV,
 } from "../../shared/subagent-environment";
+import { isPiUsageEntry } from "../../shared/usage-events";
 import {
 	readField,
 	readNonEmptyString as readString,
@@ -100,6 +102,7 @@ interface PromptRpcCommand {
 
 interface InvocationHandle {
 	readonly acceptance: InvocationAcceptance;
+	readonly agentId: string;
 	readonly ownerRuntimeLeaseId?: string;
 	readonly launchDepth: number;
 	readonly process: ChildProcess;
@@ -380,6 +383,7 @@ export class InvocationSupervisor implements InvocationControl {
 					? {}
 					: { contextWindow: launch.runtimeFacts.contextWindow }),
 			},
+			agentId: request.agentId,
 			...(request.ownerRuntimeLeaseId === undefined
 				? {}
 				: { ownerRuntimeLeaseId: request.ownerRuntimeLeaseId }),
@@ -427,6 +431,9 @@ export class InvocationSupervisor implements InvocationControl {
 			...this.options.childEnvironment,
 			[SUBAGENT_RUNTIME_LEASE_ENV]: runtimeLeaseId,
 			[SUBAGENT_OWNER_SESSION_ENV]: childPiSessionId,
+			...(this.options.rootSessionId === undefined
+				? {}
+				: { [SUBAGENT_ROOT_SESSION_ID_ENV]: this.options.rootSessionId }),
 			[SUBAGENT_AGENT_ID_ENV]: request.agentId,
 			[SUBAGENT_DEPTH_ENV]: String(launch?.depth ?? 0),
 			...(launch?.toolPatterns === undefined
@@ -695,6 +702,17 @@ export class InvocationSupervisor implements InvocationControl {
 		if (type !== undefined && type !== "message_update") {
 			for (const listener of this.activityListeners) {
 				listener(handle.acceptance.invocationId);
+			}
+		}
+		if (type === "entry_appended") {
+			const entry = readField(value, "entry");
+			if (isPiUsageEntry(entry) && this.options.rootSessionId !== undefined) {
+				this.options.onUsageEntry?.({
+					entry,
+					sessionId: handle.acceptance.childPiSessionId,
+					rootSessionId: this.options.rootSessionId,
+					agentId: handle.agentId,
+				});
 			}
 		}
 		if (type === "message_end") {

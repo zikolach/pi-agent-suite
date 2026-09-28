@@ -6,6 +6,7 @@ import type {
 import type { ChildRpcRuntimeFacts } from "../../shared/child-rpc-completion";
 import type { ChildStartupConfig } from "../../shared/child-startup-config";
 import type { ChildStartupGate } from "../../shared/child-startup-gate";
+import type { UsageEntryRecordRequest } from "../../shared/usage-events";
 import type { SubagentFailedCode } from "./contracts";
 import type { LogicalSession, OwnerIdentity, SessionKey } from "./domain";
 import type {
@@ -125,6 +126,9 @@ export interface WorkerLaunchRequest extends InvocationScope {
 export interface InvocationSupervisorOptions {
 	readonly bridge: RootRuntimeBridge;
 	readonly onEvent: (event: InvocationEvent) => Promise<void> | void;
+	readonly onUsageEntry?: (
+		usage: Omit<UsageEntryRecordRequest, "version">,
+	) => void;
 	readonly onRuntimeFailure?: (failure: RuntimeChannelFailure) => void;
 	readonly onRuntimeModelChanged?: (change: RuntimeModelChange) => void;
 	readonly onRuntimeRequest?: (
@@ -138,6 +142,7 @@ export interface InvocationSupervisorOptions {
 	readonly packagePath?: string;
 	readonly command?: string;
 	readonly childEnvironment?: Readonly<Record<string, string>>;
+	readonly rootSessionId?: string;
 	readonly childStartupConfig: ChildStartupConfig;
 	readonly recordChildStartupAttempt: (
 		record: ChildAuthStartupAttemptRecord,

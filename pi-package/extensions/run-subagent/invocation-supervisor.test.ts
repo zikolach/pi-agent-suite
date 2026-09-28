@@ -20,9 +20,14 @@ import type { ChildStartupConfig } from "../../shared/child-startup-config";
 import { COMPACTION_TRIGGER_INTERRUPTION_TYPE } from "../../shared/compaction-trigger-protocol";
 import {
 	SUBAGENT_OWNER_SESSION_ENV,
+	SUBAGENT_ROOT_SESSION_ID_ENV,
 	SUBAGENT_RUNTIME_LEASE_ENV,
 	SUBAGENT_WORKFLOW_IDS_ENV,
 } from "../../shared/subagent-environment";
+import type {
+	PiUsageEntry,
+	UsageEntryRecordRequest,
+} from "../../shared/usage-events";
 import { publishWorkflowCatalogPolicy } from "../../shared/workflow-policy";
 import { resolveLaunchConfiguration } from "./agent-policy";
 import { SubagentCoordinator } from "./coordinator";
@@ -267,11 +272,13 @@ interface SupervisorHarnessOptions {
 	readonly onSpawnEnvironment?: (environment: NodeJS.ProcessEnv) => void;
 	readonly onSpawn?: (args: readonly string[], cwd: string) => void;
 	readonly sessionsDir?: string;
+	readonly rootSessionId?: string;
 	readonly childStartupConfig?: ChildStartupConfig;
 	readonly recordChildStartupAttempt?: (
 		record: ChildAuthStartupAttemptRecord,
 	) => void;
 	readonly onRuntimeModelChanged?: InvocationSupervisorOptions["onRuntimeModelChanged"];
+	readonly onUsageEntry?: InvocationSupervisorOptions["onUsageEntry"];
 }
 
 /** Creates one supervisor whose successive launches consume controlled child processes. */
@@ -310,6 +317,9 @@ function createSupervisorHarness(
 				},
 			})),
 		sessionsDir: options.sessionsDir ?? supervisorSessionsRoot,
+		...(options.rootSessionId === undefined
+			? {}
+			: { rootSessionId: options.rootSessionId }),
 		spawnProcess: (_command, args, spawnOptions) => {
 			options.onSpawnEnvironment?.(spawnOptions.env);
 			options.onSpawn?.(args, spawnOptions.cwd);
@@ -338,6 +348,9 @@ function createSupervisorHarness(
 		...(options.onRuntimeModelChanged === undefined
 			? {}
 			: { onRuntimeModelChanged: options.onRuntimeModelChanged }),
+		...(options.onUsageEntry === undefined
+			? {}
+			: { onUsageEntry: options.onUsageEntry }),
 	};
 	const supervisor = new InvocationSupervisor(supervisorOptions);
 	return { supervisor, spawnCount: () => spawnCount };
@@ -630,6 +643,51 @@ describe("InvocationSupervisor", () => {
 				process.env[SUBAGENT_WORKFLOW_IDS_ENV] = previous;
 			}
 		}
+	});
+
+	test("propagates one root session identity through direct and descendant launches", async () => {
+		// Purpose: every launched Pi process must inherit one root family without replacing its own child session identity.
+		// Inputs and expected output: launches for root and descendant owners receive the same root environment value and distinct owner-session values.
+		// Edge case: the descendant launch uses a different owner Pi session while retaining the original root.
+		// Dependencies: production supervisor spawning, child environment construction, and controlled Pi processes.
+		const direct = createChildProcess();
+		const descendant = createChildProcess();
+		const environments: NodeJS.ProcessEnv[] = [];
+		const harness = createSupervisorHarness(
+			[direct, descendant],
+			[],
+			undefined,
+			undefined,
+			true,
+			{
+				rootSessionId: "root-session",
+				onSpawnEnvironment: (environment) => environments.push(environment),
+			},
+		);
+
+		await acceptStart(harness.supervisor, direct, {
+			ownerPiSessionId: "root-session",
+			ownerLocalSessionId: 1,
+		});
+		await acceptStart(harness.supervisor, descendant, {
+			ownerPiSessionId: "direct-child-session",
+			ownerLocalSessionId: 2,
+		});
+
+		expect(
+			environments.map((environment) => ({
+				root: environment[SUBAGENT_ROOT_SESSION_ID_ENV],
+				own: environment[SUBAGENT_OWNER_SESSION_ENV],
+			})),
+		).toEqual([
+			{ root: "root-session", own: expect.any(String) },
+			{ root: "root-session", own: expect.any(String) },
+		]);
+		expect(environments[0]?.[SUBAGENT_OWNER_SESSION_ENV]).not.toBe(
+			environments[1]?.[SUBAGENT_OWNER_SESSION_ENV],
+		);
+		direct.emitClose();
+		descendant.emitClose();
 	});
 
 	test("rechecks parent authentication before every startup attempt", async () => {
@@ -1253,6 +1311,86 @@ describe("InvocationSupervisor", () => {
 		unsubscribe();
 
 		expect(activity).toEqual([acceptance.invocationId]);
+	});
+
+	test("forwards only valid appended usage with child attribution", async () => {
+		// Purpose: cache-warming usage from a supervised Pi process must reach the root usage boundary.
+		// Inputs and expected output: an arbitrary-kind usage entry is forwarded unchanged with child, root, and agent identities.
+		// Edge case: a non-usage append and malformed usage values still produce activity but no usage forwarding.
+		// Dependencies: controlled child-process RPC streams and an isolated supervisor usage sink.
+		const child = createChildProcess();
+		const forwarded: Omit<UsageEntryRecordRequest, "version">[] = [];
+		const supervisor = createSupervisorHarness(
+			[child],
+			[],
+			undefined,
+			undefined,
+			true,
+			{
+				rootSessionId: "root-session",
+				onUsageEntry: (usage) => forwarded.push(usage),
+			},
+		).supervisor;
+		const acceptance = await acceptStart(supervisor, child);
+		const activity: string[] = [];
+		const unsubscribe = supervisor.subscribeActivity((invocationId) =>
+			activity.push(invocationId),
+		);
+		const entry: PiUsageEntry = {
+			type: "usage",
+			id: "usage-a",
+			parentId: null,
+			timestamp: "2026-09-20T10:00:00.000Z",
+			kind: "future-kind",
+			provider: "provider-a",
+			model: "model-a",
+			usage: {
+				input: 10,
+				output: 2,
+				cacheRead: 3,
+				cacheWrite: 4,
+				totalTokens: 19,
+				cost: {
+					input: 0.1,
+					output: 0.2,
+					cacheRead: 0.03,
+					cacheWrite: 0.04,
+					total: 0.37,
+				},
+			},
+		};
+
+		child.stdout?.emit(
+			"data",
+			Buffer.from(
+				`${JSON.stringify({ type: "entry_appended", entry })}\n${JSON.stringify(
+					{
+						type: "entry_appended",
+						entry: { ...entry, type: "custom" },
+					},
+				)}\n${JSON.stringify({
+					type: "entry_appended",
+					entry: { ...entry, usage: { ...entry.usage, input: "10" } },
+				})}\n`,
+			),
+		);
+		await Promise.resolve();
+		await Promise.resolve();
+		unsubscribe();
+
+		expect(forwarded).toEqual([
+			{
+				entry,
+				sessionId: acceptance.childPiSessionId,
+				rootSessionId: "root-session",
+				agentId: "SubAgentCoder",
+			},
+		]);
+		expect(activity).toEqual([
+			acceptance.invocationId,
+			acceptance.invocationId,
+			acceptance.invocationId,
+		]);
 	});
 
 	test("clears transient notification when a permanent message arrives", async () => {

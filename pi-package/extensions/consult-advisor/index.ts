@@ -23,14 +23,16 @@ import {
 	readExtensionConfigFile,
 	readExtensionConfigFileSync,
 } from "../../shared/agent-suite-storage";
-import { resolveAuxiliaryLlmRuntime } from "../../shared/auxiliary-llm";
+import {
+	resolveAuxiliaryLlmRuntime,
+	withoutSystemMessages,
+} from "../../shared/auxiliary-llm";
 import { createAuxiliaryLlmSessionId } from "../../shared/auxiliary-llm-session";
 import {
 	collectLoadedSkillRoots,
 	replayContextProjection,
 } from "../../shared/context-projection";
 import { estimateSerializedInputTokens } from "../../shared/context-size";
-import { recordHelperApiCost } from "../../shared/helper-api-cost";
 import {
 	appendKnowledgeBlock,
 	readKnowledgeBlock,
@@ -55,6 +57,7 @@ import {
 } from "../../shared/retry";
 import { truncateToolTextOutput } from "../../shared/tool-output-truncation";
 import { registerPackageTool } from "../../shared/tool-presentation/registry";
+import { publishUsageEvent } from "../../shared/usage-events";
 import {
 	renderConsultAdvisorCall,
 	renderConsultAdvisorResult,
@@ -192,7 +195,7 @@ export default function consultAdvisor(
 				loadedSkillRoots,
 				contextFiles,
 				recordCost: (message) => {
-					recordHelperApiCost(pi, "consult-advisor", message);
+					publishUsageEvent(pi, "consult-advisor", message);
 				},
 			});
 		},
@@ -560,7 +563,7 @@ async function buildAdvisorContext({
 		loadedSkillRoots,
 	});
 	const messages = removePendingAdvisorCall(
-		convertToLlm(projectedMessages),
+		convertToLlm(withoutSystemMessages(projectedMessages)),
 		toolCallId,
 	);
 	messages.push({ role: "user", content: question, timestamp: Date.now() });

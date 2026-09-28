@@ -6,12 +6,14 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
 	addPendingProjectionSavings,
+	buildContextEntryMapping,
 	type ContextProjectionConfig,
-	estimatePendingProjectionSavings,
+	estimateEffectiveProjectionSavings,
 	getProjectionAwareContextUsage,
 	type MappedContextEntry,
 	mapEventMessagesToBranchEntries,
 	projectContextMessages,
+	publishRuntimeProjectedReplacements,
 	readContextProjectionConfig,
 	replayContextProjection,
 	replayPersistedContextProjection,
@@ -130,6 +132,45 @@ function projectionStateEntry(
 	} as SessionEntry;
 }
 
+/** Creates one append-only context edit for an earlier source entry. */
+function contextEditEntry(
+	id: string,
+	parentId: string,
+	targetId: string,
+	replacement: Extract<SessionEntry, { type: "context_edit" }>["replacement"],
+): SessionEntry {
+	return {
+		type: "context_edit",
+		id,
+		parentId,
+		timestamp: "t",
+		targetId,
+		replacement,
+	};
+}
+
+/** Creates one compaction boundary while retaining the complete prior branch. */
+function compactionEntry(
+	id: string,
+	parentId: string,
+	firstKeptEntryId: string,
+): SessionEntry {
+	return {
+		type: "compaction",
+		id,
+		parentId,
+		timestamp: "t",
+		summary: "Retained summary.",
+		firstKeptEntryId,
+		tokensBefore: 100,
+	} as SessionEntry;
+}
+
+/** Creates a system message. */
+function systemMessage(): AgentMessage {
+	return { role: "system", content: "Primary system state.", timestamp: 0 };
+}
+
 /** Creates a user message. */
 function userMessage(text = "hello"): AgentMessage {
 	return { role: "user", content: text, timestamp: 1 };
@@ -171,7 +212,7 @@ function toolResultMessage(
 	toolCallId: string,
 	text: string,
 	toolName = "bash",
-): AgentMessage {
+): Extract<AgentMessage, { role: "toolResult" }> {
 	return {
 		role: "toolResult",
 		toolCallId,
@@ -180,6 +221,26 @@ function toolResultMessage(
 		isError: false,
 		timestamp: 3,
 	};
+}
+
+function readSynchronizedProjectionUsage(
+	sessionId: string,
+	branchEntries: readonly SessionEntry[],
+): number | null | undefined {
+	const savings = estimateEffectiveProjectionSavings({
+		branchEntries,
+		cwd: "/tmp/project",
+		config: PROJECTION_CONFIG,
+	});
+	setPendingProjectionSavings(sessionId, {
+		entries: savings.entries,
+		branchEntries,
+	});
+	return getProjectionAwareContextUsage(sessionId, branchEntries, {
+		tokens: 1_000,
+		contextWindow: 10_000,
+		percent: 10,
+	})?.tokens;
 }
 
 describe("context projection config", () => {
@@ -413,14 +474,25 @@ describe("projection-aware context usage", () => {
 		// Edge case: pending savings larger than raw tokens clamps usage to zero.
 		// Dependencies: in-memory runtime projection state only.
 		const sessionId = "projection-aware-usage";
+		const branchEntries = [
+			messageEntry("entry-1", userMessage("projected one"), null),
+			messageEntry("entry-2", userMessage("projected two"), "entry-1"),
+			messageEntry("leaf-1", userMessage("start"), "entry-2"),
+		];
 		resetPendingProjectionSavings(sessionId);
-		addPendingProjectionSavings(sessionId, 48_000, {
+		addPendingProjectionSavings(sessionId, {
 			branchLeafId: "leaf-1",
-			entryIds: ["entry-1"],
+			entries: [
+				{
+					entryId: "entry-1",
+					replacementText: OMITTED_NOTICE,
+					savedTokens: 48_000,
+				},
+			],
 		});
 
 		expect(
-			getProjectionAwareContextUsage(sessionId, {
+			getProjectionAwareContextUsage(sessionId, branchEntries, {
 				tokens: 130_000,
 				contextWindow: 272_000,
 				percent: 47.79,
@@ -431,12 +503,18 @@ describe("projection-aware context usage", () => {
 			percent: (82_000 / 272_000) * 100,
 		});
 
-		addPendingProjectionSavings(sessionId, 100_000, {
+		addPendingProjectionSavings(sessionId, {
 			branchLeafId: "leaf-1",
-			entryIds: ["entry-2"],
+			entries: [
+				{
+					entryId: "entry-2",
+					replacementText: OMITTED_NOTICE,
+					savedTokens: 100_000,
+				},
+			],
 		});
 		expect(
-			getProjectionAwareContextUsage(sessionId, {
+			getProjectionAwareContextUsage(sessionId, branchEntries, {
 				tokens: 90_000,
 				contextWindow: 272_000,
 				percent: (90_000 / 272_000) * 100,
@@ -451,15 +529,27 @@ describe("projection-aware context usage", () => {
 		// Edge case: branch synchronization runs between provider context projection and custom entry visibility.
 		// Dependencies: in-memory runtime projection state only.
 		const sessionId = "projection-aware-live-sync";
+		const branchEntries = [
+			messageEntry("entry-1", userMessage("projected"), null),
+			messageEntry("leaf-1", userMessage("start"), "entry-1"),
+		];
+		const savingsEntry = {
+			entryId: "entry-1",
+			replacementText: OMITTED_NOTICE,
+			savedTokens: 48_000,
+		};
 		resetPendingProjectionSavings(sessionId);
-		addPendingProjectionSavings(sessionId, 48_000, {
+		addPendingProjectionSavings(sessionId, {
 			branchLeafId: "leaf-1",
-			entryIds: ["entry-1"],
+			entries: [savingsEntry],
 		});
 
-		setPendingProjectionSavings(sessionId, 0, [], new Set(["leaf-1"]));
+		setPendingProjectionSavings(sessionId, {
+			entries: [],
+			branchEntries,
+		});
 		expect(
-			getProjectionAwareContextUsage(sessionId, {
+			getProjectionAwareContextUsage(sessionId, branchEntries, {
 				tokens: 130_000,
 				contextWindow: 272_000,
 				percent: (130_000 / 272_000) * 100,
@@ -470,14 +560,15 @@ describe("projection-aware context usage", () => {
 			percent: (82_000 / 272_000) * 100,
 		});
 
-		setPendingProjectionSavings(
-			sessionId,
-			48_000,
-			["entry-1"],
-			new Set(["leaf-1"]),
+		branchEntries.push(
+			projectionStateEntry("state-1", "entry-1", OMITTED_NOTICE, "leaf-1"),
 		);
+		setPendingProjectionSavings(sessionId, {
+			entries: [savingsEntry],
+			branchEntries,
+		});
 		expect(
-			getProjectionAwareContextUsage(sessionId, {
+			getProjectionAwareContextUsage(sessionId, branchEntries, {
 				tokens: 130_000,
 				contextWindow: 272_000,
 				percent: (130_000 / 272_000) * 100,
@@ -497,14 +588,26 @@ describe("projection-aware context usage", () => {
 		// Dependencies: in-memory runtime projection state only.
 		const sessionId = "projection-aware-branch-sync";
 		resetPendingProjectionSavings(sessionId);
-		addPendingProjectionSavings(sessionId, 48_000, {
+		addPendingProjectionSavings(sessionId, {
 			branchLeafId: "leaf-a",
-			entryIds: ["entry-a"],
+			entries: [
+				{
+					entryId: "entry-a",
+					replacementText: OMITTED_NOTICE,
+					savedTokens: 48_000,
+				},
+			],
 		});
+		const branchEntries = [
+			messageEntry("leaf-b", userMessage("other branch"), null),
+		];
 
-		setPendingProjectionSavings(sessionId, 0, [], new Set(["leaf-b"]));
+		setPendingProjectionSavings(sessionId, {
+			entries: [],
+			branchEntries,
+		});
 		expect(
-			getProjectionAwareContextUsage(sessionId, {
+			getProjectionAwareContextUsage(sessionId, branchEntries, {
 				tokens: 130_000,
 				contextWindow: 272_000,
 				percent: (130_000 / 272_000) * 100,
@@ -523,14 +626,21 @@ describe("projection-aware context usage", () => {
 		// Edge case: post-compaction unknown usage uses the same null shape.
 		// Dependencies: in-memory runtime projection state only.
 		const sessionId = "projection-aware-null-usage";
+		const branchEntries = [messageEntry("leaf-1", userMessage("start"), null)];
 		resetPendingProjectionSavings(sessionId);
-		addPendingProjectionSavings(sessionId, 48_000, {
+		addPendingProjectionSavings(sessionId, {
 			branchLeafId: "leaf-1",
-			entryIds: ["entry-1"],
+			entries: [
+				{
+					entryId: "entry-1",
+					replacementText: OMITTED_NOTICE,
+					savedTokens: 48_000,
+				},
+			],
 		});
 
 		expect(
-			getProjectionAwareContextUsage(sessionId, {
+			getProjectionAwareContextUsage(sessionId, branchEntries, {
 				tokens: null,
 				contextWindow: 272_000,
 				percent: null,
@@ -539,49 +649,154 @@ describe("projection-aware context usage", () => {
 		resetPendingProjectionSavings(sessionId);
 	});
 
-	test("estimates pending savings only for projection state after the latest valid assistant usage", () => {
-		// Purpose: session reload must preserve the stale-usage correction only when provider usage has not caught up.
-		// Input and expected output: projection state after latest successful usage is pending; a later successful assistant clears it.
-		// Edge case: error assistant messages after projection do not clear pending savings.
-		// Dependencies: in-memory branch entries and shared token estimation.
-		const projectedBranch = [
+	test("excludes live savings for targets removed from canonical context by compaction", () => {
+		const sessionId = "projection-aware-compacted-live-target";
+		const branchEntries = [
 			messageEntry("01", assistantMessage("call-old"), null),
 			messageEntry(
 				"02",
 				toolResultMessage("call-old", "old output ".repeat(20)),
 				"01",
 			),
-			projectionStateEntry("03", "02", OMITTED_NOTICE, "02"),
+			messageEntry("03", userMessage("retained"), "02"),
+			compactionEntry("04", "03", "03"),
+		];
+		resetPendingProjectionSavings(sessionId);
+		addPendingProjectionSavings(sessionId, {
+			branchLeafId: "02",
+			entries: [
+				{
+					entryId: "02",
+					replacementText: OMITTED_NOTICE,
+					savedTokens: 48_000,
+				},
+			],
+		});
+
+		expect(
+			getProjectionAwareContextUsage(sessionId, branchEntries, {
+				tokens: 130_000,
+				contextWindow: 272_000,
+				percent: (130_000 / 272_000) * 100,
+			}),
+		).toEqual({
+			tokens: 130_000,
+			contextWindow: 272_000,
+			percent: (130_000 / 272_000) * 100,
+		});
+		resetPendingProjectionSavings(sessionId);
+	});
+
+	test("estimates response-based savings from the latest canonically visible usable response", () => {
+		const branchBeforeLaterProjection = [
+			messageEntry("00", userMessage("start"), null),
+			messageEntry("01", assistantMessage("call-old"), "00"),
+			messageEntry(
+				"02",
+				toolResultMessage("call-old", "old output ".repeat(20)),
+				"01",
+			),
+			messageEntry("03", assistantMessage("call-later"), "02"),
 			messageEntry(
 				"04",
-				{ ...assistantMessage("call-error"), stopReason: "error" },
+				toolResultMessage("call-later", "later output ".repeat(20)),
 				"03",
 			),
+			projectionStateEntry("05", "02", OMITTED_NOTICE, "04"),
+			messageEntry("06", assistantMessage("call-response"), "05"),
+		];
+		const branch = [
+			...branchBeforeLaterProjection,
+			projectionStateEntry("07", "04", OMITTED_NOTICE, "06"),
 			messageEntry(
-				"05",
+				"08",
+				{ ...assistantMessage("call-error"), stopReason: "error" },
+				"07",
+			),
+			messageEntry(
+				"09",
 				{ ...assistantMessage("call-aborted"), stopReason: "aborted" },
-				"04",
+				"08",
+			),
+			messageEntry(
+				"10",
+				{
+					...assistantMessage("call-zero"),
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							total: 0,
+						},
+					},
+				},
+				"09",
 			),
 		];
 
-		expect(
-			estimatePendingProjectionSavings({
-				branchEntries: projectedBranch,
-				cwd: "/tmp/project",
-				config: PROJECTION_CONFIG,
-			}).savedTokens,
-		).toBeGreaterThan(0);
+		const sessionId = "response-based-savings";
+		resetPendingProjectionSavings(sessionId);
+		const beforeLaterProjection = readSynchronizedProjectionUsage(
+			sessionId,
+			branchBeforeLaterProjection,
+		);
+		const afterLaterProjection = readSynchronizedProjectionUsage(
+			sessionId,
+			branch,
+		);
 
+		expect(beforeLaterProjection).toBe(1_000);
+		expect(afterLaterProjection).toBeLessThan(1_000);
 		expect(
-			estimatePendingProjectionSavings({
-				branchEntries: [
-					...projectedBranch,
-					messageEntry("06", assistantMessage("call-new"), "05"),
-				],
-				cwd: "/tmp/project",
-				config: PROJECTION_CONFIG,
-			}).savedTokens,
-		).toBe(0);
+			readSynchronizedProjectionUsage(sessionId, [
+				...branch,
+				messageEntry("11", assistantMessage("call-new"), "10"),
+			]),
+		).toBe(1_000);
+		resetPendingProjectionSavings(sessionId);
+	});
+
+	test("uses canonical-estimate savings after edits and without a visible usable response", () => {
+		const branch = [
+			messageEntry("00", userMessage("start"), null),
+			messageEntry("01", assistantMessage("call-old"), "00"),
+			messageEntry(
+				"02",
+				toolResultMessage("call-old", "old output ".repeat(20)),
+				"01",
+			),
+			projectionStateEntry("03", "02", OMITTED_NOTICE, "02"),
+			messageEntry("04", assistantMessage("call-response"), "03"),
+		];
+
+		const sessionId = "canonical-estimate-savings";
+		resetPendingProjectionSavings(sessionId);
+		expect(readSynchronizedProjectionUsage(sessionId, branch)).toBe(1_000);
+
+		const afterUnrelatedEdit = readSynchronizedProjectionUsage(sessionId, [
+			...branch,
+			contextEditEntry("05", "04", "00", { content: "edited start" }),
+		]);
+		const afterOmittedResponse = readSynchronizedProjectionUsage(sessionId, [
+			...branch,
+			contextEditEntry("05", "04", "04", null),
+		]);
+		const afterCompaction = readSynchronizedProjectionUsage(sessionId, [
+			...branch,
+			compactionEntry("05", "04", "00"),
+		]);
+
+		expect(afterUnrelatedEdit).toBeLessThan(1_000);
+		expect(afterOmittedResponse).toBe(afterUnrelatedEdit);
+		expect(afterCompaction).toBe(afterUnrelatedEdit);
+		resetPendingProjectionSavings(sessionId);
 	});
 });
 
@@ -620,6 +835,122 @@ describe("context projection replay", () => {
 		});
 	});
 
+	test("replays Pi-edited history independently of repository projection config", async () => {
+		await withIsolatedAgentDir(async (agentDir) => {
+			await writeProjectionConfig(agentDir, { enabled: false });
+			const branchEntries = [
+				messageEntry("user", userMessage("omit me"), null),
+				messageEntry("assistant", assistantMessage("call"), "user"),
+				messageEntry(
+					"tool",
+					toolResultMessage("call", "raw output"),
+					"assistant",
+				),
+				contextEditEntry("omit", "tool", "user", null),
+				contextEditEntry("replace", "omit", "tool", {
+					content: "edited output",
+				}),
+			];
+
+			const replayed = await replayContextProjection({
+				branchEntries,
+				cwd: "/tmp/project",
+			});
+
+			expect(replayed.map((message) => message.role)).toEqual([
+				"assistant",
+				"toolResult",
+			]);
+			expect(replayed[1]).toMatchObject({
+				toolCallId: "call",
+				content: [{ type: "text", text: "edited output" }],
+			});
+		});
+	});
+
+	test("applies repository replacements in append order around context edits", async () => {
+		await withIsolatedAgentDir(async (agentDir) => {
+			await writeProjectionConfig(agentDir, { enabled: true });
+			const cwd = "/tmp/ordered-projection";
+			const entriesBeforeReprojection = [
+				messageEntry("01", assistantMessage("call-a"), null),
+				messageEntry("02", toolResultMessage("call-a", "raw a"), "01"),
+				messageEntry("03", assistantMessage("call-b"), "02"),
+				messageEntry("04", toolResultMessage("call-b", "raw b"), "03"),
+				projectionStateEntry("05", "02", "projected a", "04"),
+				projectionStateEntry("06", "04", "projected b", "05"),
+				contextEditEntry("07", "06", "02", { content: "edited a" }),
+				{
+					type: "custom",
+					id: "08",
+					parentId: "07",
+					timestamp: "t",
+					customType: CUSTOM_TYPE,
+					data: { projectedEntries: [] },
+				} as SessionEntry,
+			];
+			publishRuntimeProjectedReplacements(
+				cwd,
+				new Map([
+					["02", "stale runtime a"],
+					["04", "runtime b"],
+				]),
+				"04",
+			);
+
+			const persisted = replayPersistedContextProjection(
+				entriesBeforeReprojection,
+			);
+			const runtime = await replayContextProjection({
+				branchEntries: entriesBeforeReprojection,
+				cwd,
+			});
+
+			expect([persisted[1], persisted[3]]).toMatchObject([
+				{ content: [{ type: "text", text: "edited a" }] },
+				{ content: [{ type: "text", text: "projected b" }] },
+			]);
+			expect([runtime[1], runtime[3]]).toMatchObject([
+				{ content: [{ type: "text", text: "edited a" }] },
+				{ content: [{ type: "text", text: "projected b" }] },
+			]);
+			const retained = await replayRetainedContextProjection({
+				branchEntries: entriesBeforeReprojection,
+				firstKeptEntryId: "01",
+				cwd,
+			});
+			expect([retained[1], retained[3]]).toMatchObject([
+				{ content: [{ type: "text", text: "edited a" }] },
+				{ content: [{ type: "text", text: "projected b" }] },
+			]);
+
+			const entriesAfterReprojection = [
+				...entriesBeforeReprojection,
+				projectionStateEntry("09", "02", "new projected a", "08"),
+			];
+			const replayedAfterReprojection = replayPersistedContextProjection(
+				entriesAfterReprojection,
+			);
+			expect([
+				replayedAfterReprojection[1],
+				replayedAfterReprojection[3],
+			]).toMatchObject([
+				{ content: [{ type: "text", text: "new projected a" }] },
+				{ content: [{ type: "text", text: "projected b" }] },
+			]);
+
+			const omitted = replayPersistedContextProjection([
+				...entriesAfterReprojection,
+				contextEditEntry("10", "09", "02", null),
+			]);
+			expect(omitted).toHaveLength(3);
+			expect(omitted.at(-1)).toMatchObject({
+				content: [{ type: "text", text: "projected b" }],
+			});
+			publishRuntimeProjectedReplacements(cwd, new Map(), null);
+		});
+	});
+
 	test("replays persisted replacements when projection config is valid", async () => {
 		// Purpose: advisor input must reuse recorded projection instead of sending full old tool output.
 		// Input and expected output: valid config plus one projected entry replaces only that tool result with its replacement text.
@@ -628,7 +959,8 @@ describe("context projection replay", () => {
 		await withIsolatedAgentDir(async (agentDir) => {
 			await writeProjectionConfig(agentDir, { enabled: true });
 			const branchEntries = [
-				messageEntry("01", userMessage(), null),
+				messageEntry("00", systemMessage(), null),
+				messageEntry("01", userMessage(), "00"),
 				messageEntry("02", assistantMessage("call-old"), "01"),
 				messageEntry("03", toolResultMessage("call-old", "old output"), "02"),
 				projectionStateEntry("04", "03", OMITTED_NOTICE, "03"),
@@ -639,6 +971,12 @@ describe("context projection replay", () => {
 				cwd: "/tmp/project",
 			});
 
+			expect(messages.map((message) => message.role)).toEqual([
+				"system",
+				"user",
+				"assistant",
+				"toolResult",
+			]);
 			expect(JSON.stringify(messages)).not.toContain("old output");
 			expect(JSON.stringify(messages)).toContain(OMITTED_NOTICE);
 		});
@@ -851,6 +1189,124 @@ describe("context projection replay", () => {
 });
 
 describe("context entry mapping", () => {
+	test("maps Pi omissions and normalized replacements without changing raw entries", () => {
+		const omittedUser = messageEntry("user", userMessage("raw user"), null);
+		const assistant = messageEntry(
+			"assistant",
+			assistantMessage("call-edited"),
+			"user",
+		);
+		const rawToolResult = toolResultMessage("call-edited", "raw tool output");
+		const toolResult = messageEntry("tool", rawToolResult, "assistant");
+		const branchEntries = [
+			omittedUser,
+			assistant,
+			toolResult,
+			contextEditEntry("omit-user", "tool", "user", null),
+			contextEditEntry("replace-tool", "omit-user", "tool", {
+				content: "edited tool output",
+			}),
+		];
+
+		const mapped = buildContextEntryMapping(branchEntries);
+		const replayed = replayPersistedContextProjection(branchEntries);
+
+		expect(
+			mapped.map(({ entry, message }) => [entry.id, message.role]),
+		).toEqual([
+			["assistant", "assistant"],
+			["tool", "toolResult"],
+		]);
+		expect(mapped[1]?.message).toMatchObject({
+			role: "toolResult",
+			toolCallId: "call-edited",
+			content: [{ type: "text", text: "edited tool output" }],
+		});
+		expect(replayed).toEqual(mapped.map(({ message }) => message));
+		expect(omittedUser).toMatchObject({ message: { content: "raw user" } });
+		expect(rawToolResult.content).toEqual([
+			{ type: "text", text: "raw tool output" },
+		]);
+	});
+
+	test("maps Pi compaction checkpoints and later updates to their source entries", () => {
+		const branchEntries: SessionEntry[] = [
+			messageEntry(
+				"old-system",
+				{ role: "system", content: "old instructions", timestamp: 1 },
+				null,
+			),
+			messageEntry(
+				"kept-system",
+				{ role: "system", content: "replaced instructions", timestamp: 2 },
+				"old-system",
+			),
+			messageEntry("kept-user", userMessage("retained request"), "kept-system"),
+			{
+				type: "compaction",
+				id: "compaction",
+				parentId: "kept-user",
+				timestamp: "2026-08-26T16:00:00.000Z",
+				summary: "history summary",
+				firstKeptEntryId: "kept-system",
+				tokensBefore: 1_000,
+				systemMessage: {
+					role: "system",
+					content: "checkpoint instructions",
+					timestamp: 3,
+				},
+			},
+			messageEntry(
+				"post-system",
+				{ role: "system", content: "later instructions", timestamp: 4 },
+				"compaction",
+			),
+			messageEntry("post-user", userMessage("later request"), "post-system"),
+		];
+		const mappedEntries = buildContextEntryMapping(branchEntries);
+
+		expect(mappedEntries.map(({ message }) => message.role)).toEqual([
+			"system",
+			"compactionSummary",
+			"user",
+			"system",
+			"user",
+		]);
+		expect(mappedEntries.map(({ entry }) => entry.id)).toEqual([
+			"compaction",
+			"compaction",
+			"kept-user",
+			"post-system",
+			"post-user",
+		]);
+		expect(
+			mappedEntries.map(({ message }) =>
+				message.role === "system" ? message.content : undefined,
+			),
+		).toEqual([
+			"checkpoint instructions",
+			undefined,
+			undefined,
+			"later instructions",
+			undefined,
+		]);
+		const systemFreeEvent = mappedEntries
+			.filter(({ message }) => message.role !== "system")
+			.map(({ message }) => structuredClone(message));
+		const eventMappedEntries = mapEventMessagesToBranchEntries(
+			systemFreeEvent,
+			branchEntries,
+		);
+		expect(eventMappedEntries?.map(({ message }) => message)).toEqual(
+			systemFreeEvent,
+		);
+		expect(eventMappedEntries?.map(({ entry }) => entry.id)).toEqual([
+			"compaction",
+			"kept-user",
+			"post-user",
+		]);
+	});
+
 	test("matches a live custom message when persistence assigned a different timestamp", () => {
 		// Purpose: Pi assigns separate timestamps to the live custom message and its persisted session entry.
 		// Input and expected output: otherwise identical workflow messages map to the same session entry despite different timestamps.

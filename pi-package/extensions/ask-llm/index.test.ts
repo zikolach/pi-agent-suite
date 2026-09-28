@@ -4,12 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type {
-	Api,
-	AssistantMessage,
-	Context,
-	Model,
-	SimpleStreamOptions,
+import {
+	type Api,
+	type AssistantMessage,
+	type Context,
+	getCurrentTools,
+	type Model,
+	normalizeContext,
+	type SimpleStreamOptions,
+	type Tool,
 } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
@@ -18,6 +21,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteProvider } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import { registerKnowledgeContextRuntime } from "../../shared/knowledge-runtime";
 import askLlm from "./index.ts";
 
@@ -25,7 +29,11 @@ const AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
 const AGENT_SUITE_DIR_ENV = "PI_AGENT_SUITE_DIR";
 const USER_QUESTION_OPEN_TAG = "<user_question>";
 const USER_QUESTION_CLOSE_TAG = "</user_question>";
-const CONTEXT_PROJECTION_CUSTOM_TYPE = "context-projection";
+const PRIMARY_TOOL: Tool = {
+	name: "primary_tool",
+	description: "Primary transcript tool.",
+	parameters: Type.Object({}),
+};
 /** Matches Pi-compatible UUIDv7 provider session identifiers. */
 const AUXILIARY_SESSION_ID_PATTERN =
 	/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -54,6 +62,7 @@ interface ExtensionApiFake extends ExtensionAPI {
 	readonly commands: RegisteredCommandFake[];
 	readonly sessionWriteCalls: string[];
 	readonly beforeAgentStartHandlers: BeforeAgentStartHandler[];
+	readonly usageEvents: unknown[];
 }
 
 interface CompletionCall {
@@ -160,11 +169,13 @@ function createExtensionApiFake(): ExtensionApiFake {
 	const commands: RegisteredCommandFake[] = [];
 	const sessionWriteCalls: string[] = [];
 	const beforeAgentStartHandlers: BeforeAgentStartHandler[] = [];
+	const usageEvents: unknown[] = [];
 
 	return {
 		commands,
 		sessionWriteCalls,
 		beforeAgentStartHandlers,
+		usageEvents,
 		on(eventName: string, handler: BeforeAgentStartHandler): void {
 			if (eventName === "before_agent_start") {
 				beforeAgentStartHandlers.push(handler);
@@ -217,7 +228,11 @@ function createExtensionApiFake(): ExtensionApiFake {
 		registerProvider(): void {},
 		unregisterProvider(): void {},
 		events: {
-			emit(): void {},
+			emit(name: string, value: unknown): void {
+				if (name === "pi-agent-suite.usage.record.v1") {
+					usageEvents.push(value);
+				}
+			},
 			on(): () => void {
 				return () => {};
 			},
@@ -516,6 +531,19 @@ function createSessionMessageEntry(
 	});
 }
 
+/** Creates one primary-session system update with a tool declaration. */
+function createSystemMessageEntry(
+	id: string,
+	parentId: string | null,
+): SessionEntry {
+	return createMessageEntry(id, parentId, {
+		role: "system",
+		content: "Primary system update.",
+		toolsAdded: [PRIMARY_TOOL],
+		timestamp: 1,
+	});
+}
+
 /** Creates a session message entry for direct provider-context assertions. */
 function createMessageEntry(
 	id: string,
@@ -528,25 +556,6 @@ function createMessageEntry(
 		parentId,
 		timestamp: "t",
 		message,
-	} as SessionEntry;
-}
-
-/** Creates an extension-owned projection state entry. */
-function createProjectionStateEntry(
-	id: string,
-	projectedEntryId: string,
-	replacementText: string,
-	parentId: string | null,
-): SessionEntry {
-	return {
-		type: "custom",
-		id,
-		parentId,
-		timestamp: "t",
-		customType: CONTEXT_PROJECTION_CUSTOM_TYPE,
-		data: {
-			projectedEntries: [{ entryId: projectedEntryId, replacementText }],
-		},
 	} as SessionEntry;
 }
 
@@ -739,6 +748,33 @@ describe("ask-llm", () => {
 			});
 			expect(ctx.renderedCustomOutputs.join("\n")).toContain("Visible answer");
 			expect(pi.sessionWriteCalls).toEqual([]);
+		});
+	});
+
+	test("publishes one complete successful ask-llm response", async () => {
+		// Purpose: completed ask-llm consumption must enter the shared usage stream once.
+		// Input and expected output: one successful response publishes its full assistant message with source ask-llm.
+		// Edge case: publication occurs only after the accepted response boundary.
+		// Dependencies: isolated config, fake model completion, and fake extension event bus.
+		await withIsolatedAgentDir(async () => {
+			const model = createModel("openai", "gpt-test");
+			const completion = createCompletionFake("Visible answer");
+			const pi = createExtensionApiFake();
+			const ctx = createContextFake([model]);
+			askLlm(pi, { completeSimple: completion.completeSimple });
+
+			await getAskCommand(pi).handler("What should I check?", ctx);
+
+			expect(pi.usageEvents).toHaveLength(1);
+			expect(pi.usageEvents[0]).toMatchObject({
+				source: "ask-llm",
+				message: {
+					role: "assistant",
+					provider: "openai",
+					model: "gpt-test",
+					usage: expect.any(Object),
+				},
+			});
 		});
 	});
 
@@ -1045,30 +1081,34 @@ describe("ask-llm", () => {
 		});
 	});
 
-	test("replays persisted context projection state before calling ask-llm", async () => {
-		// Purpose: ask-llm input must match the projected task state when context-projection has recorded omitted tool results.
-		// Input and expected output: valid projection config plus persisted state replaces old tool output with the recorded replacement text.
-		// Edge case: the one-off ask question is appended after projection replay.
-		// Dependencies: temp context-projection config, fake model registry, fake completion function, and fake session entries.
+	test("isolates Pi-edited history before calling ask-llm", async () => {
 		await withIsolatedAgentDir(async (agentDir) => {
 			await writeProjectionConfig(agentDir, { enabled: true });
-			const replacementText = "[projected old output]";
+			const replacementText = "edited old output";
 			const model = createModel("openai", "gpt-test");
 			const completion = createCompletionFake();
 			const pi = createExtensionApiFake();
 			const entries = [
-				createSessionMessageEntry("1", null, "hello"),
-				createMessageEntry(
-					"2",
-					"1",
-					createAssistantToolCallMessage("old-tool"),
-				),
+				createSystemMessageEntry("1", null),
+				createSessionMessageEntry("2", "1", "hello"),
 				createMessageEntry(
 					"3",
 					"2",
+					createAssistantToolCallMessage("old-tool"),
+				),
+				createMessageEntry(
+					"4",
+					"3",
 					createToolResultMessage("old-tool", "old full tool output"),
 				),
-				createProjectionStateEntry("4", "3", replacementText, "3"),
+				{
+					type: "context_edit",
+					id: "5",
+					parentId: "4",
+					timestamp: "t",
+					targetId: "4",
+					replacement: { content: replacementText },
+				} as SessionEntry,
 			];
 			const ctx = createContextFake([model], "Question from editor", entries);
 			askLlm(pi, { completeSimple: completion.completeSimple });
@@ -1076,16 +1116,24 @@ describe("ask-llm", () => {
 			await getAskCommand(pi).handler("Should we proceed?", ctx);
 
 			expect(completion.calls).toHaveLength(1);
-			const askMessages = JSON.stringify(completion.calls[0]?.context.messages);
-			expect(askMessages).toContain(replacementText);
-			expect(askMessages).not.toContain("old full tool output");
-			expect(completion.calls[0]?.context.messages.at(-1)?.content).toBe(
-				[
-					USER_QUESTION_OPEN_TAG,
-					"Should we proceed?",
-					USER_QUESTION_CLOSE_TAG,
-				].join("\n"),
-			);
+			const context = completion.calls[0]?.context;
+			if (context === undefined) {
+				throw new Error("Expected ask-llm completion context");
+			}
+			const normalized = normalizeContext(context);
+			expect(normalized.messages.map((message) => message.role)).toEqual([
+				"system",
+				"user",
+				"assistant",
+				"toolResult",
+				"user",
+			]);
+			expect(getCurrentTools(normalized.messages)).toEqual([]);
+			expect(normalized.messages[3]).toMatchObject({
+				role: "toolResult",
+				toolCallId: "old-tool",
+				content: [{ type: "text", text: replacementText }],
+			});
 		});
 	});
 
@@ -1630,9 +1678,9 @@ describe("ask-llm", () => {
 
 	test("reports empty text responses", async () => {
 		// Purpose: ask-llm must not show a blank answer when the provider response has no visible text.
-		// Input and expected output: whitespace-only answer text produces one scoped warning after one completion request.
+		// Input and expected output: whitespace-only answer text publishes its complete response and produces one scoped warning.
 		// Edge case: response text is trimmed before the empty-response decision.
-		// Dependencies: this test uses fake model completion and fake UI notifications.
+		// Dependencies: this test uses fake model completion, fake UI notifications, and the fake usage event bus.
 		await withIsolatedAgentDir(async () => {
 			const model = createModel("openai", "gpt-test");
 			const completion = createCompletionFake("   ");
@@ -1643,6 +1691,14 @@ describe("ask-llm", () => {
 			await getAskCommand(pi).handler("Call provider", ctx);
 
 			expect(completion.calls).toHaveLength(1);
+			expect(pi.usageEvents).toHaveLength(1);
+			expect(pi.usageEvents[0]).toMatchObject({
+				source: "ask-llm",
+				message: {
+					content: [{ type: "text", text: "   " }],
+					usage: expect.any(Object),
+				},
+			});
 			expect(ctx.notifications).toEqual([
 				{
 					message: "[ask-llm] model response did not contain text",

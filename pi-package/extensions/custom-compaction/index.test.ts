@@ -2,14 +2,15 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type {
-	Api,
-	AssistantMessage,
-	Context,
-	Model,
+import {
+	type Api,
+	type AssistantMessage,
+	type Context,
+	getCurrentTools,
+	type Model,
+	normalizeContext,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { HELPER_API_COST_CUSTOM_TYPE } from "../../shared/helper-api-cost";
 import customCompaction from "./index";
 
 const AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
@@ -298,6 +299,7 @@ function createCompactionEvent(
 		written: new Set(["b.ts"]),
 		edited: new Set<string>(),
 	},
+	includeSystemUpdates = false,
 ): Record<string, unknown> {
 	const oldUser = {
 		role: "user",
@@ -311,11 +313,18 @@ function createCompactionEvent(
 	};
 	const turnPrefix = { role: "user", content: "split turn", timestamp: 3 };
 	const retained = { role: "user", content: "retained task", timestamp: 4 };
+	const systemMessage = (timestamp: number) => ({
+		role: "system",
+		content: "Primary system state.",
+		timestamp,
+	});
 	return {
 		type: "session_before_compact",
 		preparation: {
 			firstKeptEntryId: "entry-keep",
-			messagesToSummarize: [oldUser, oldAssistant],
+			messagesToSummarize: includeSystemUpdates
+				? [oldUser]
+				: [oldUser, oldAssistant],
 			turnPrefixMessages: [turnPrefix],
 			isSplitTurn: true,
 			tokensBefore: 1_234,
@@ -327,12 +336,41 @@ function createCompactionEvent(
 				keepRecentTokens: 2_000,
 			},
 		},
-		branchEntries: [
-			messageEntry("entry-old-user", null, oldUser),
-			messageEntry("entry-old-assistant", "entry-old-user", oldAssistant),
-			messageEntry("entry-prefix", "entry-old-assistant", turnPrefix),
-			messageEntry("entry-keep", "entry-prefix", retained),
-		],
+		branchEntries: !includeSystemUpdates
+			? [
+					messageEntry("entry-old-user", null, oldUser),
+					messageEntry("entry-old-assistant", "entry-old-user", oldAssistant),
+					messageEntry("entry-prefix", "entry-old-assistant", turnPrefix),
+					messageEntry("entry-keep", "entry-prefix", retained),
+				]
+			: [
+					messageEntry("entry-old-user", null, oldUser),
+					messageEntry("entry-main-system", "entry-old-user", systemMessage(2)),
+					messageEntry(
+						"entry-old-assistant",
+						"entry-main-system",
+						oldAssistant,
+					),
+					messageEntry("entry-prefix", "entry-old-assistant", turnPrefix),
+					messageEntry("entry-keep", "entry-prefix", systemMessage(4)),
+					messageEntry("entry-retained", "entry-keep", retained),
+					{
+						type: "context_edit",
+						id: "edit-omit-old-assistant",
+						parentId: "entry-retained",
+						timestamp: "t",
+						targetId: "entry-old-assistant",
+						replacement: null,
+					},
+					{
+						type: "context_edit",
+						id: "edit-retained",
+						parentId: "edit-omit-old-assistant",
+						timestamp: "t",
+						targetId: "entry-retained",
+						replacement: { content: "edited retained task" },
+					},
+				],
 		reason: "threshold",
 		willRetry: false,
 		signal,
@@ -651,11 +689,7 @@ describe("custom-compaction", () => {
 		});
 	});
 
-	test("returns one adaptive result with Pi's fixed boundary and file details", async () => {
-		// Purpose: the entry shell must use one direct final request and preserve Pi lifecycle state.
-		// Input and expected output: default config plus one small response returns the original boundary, file details, and chronological source.
-		// Edge case: previous summary and split-turn prefix are both present.
-		// Dependencies: isolated config, fake Pi context, and mocked completion.
+	test("returns one adaptive result with isolated replay streams and Pi's fixed boundary", async () => {
 		await withIsolatedAgentDir(async () => {
 			completeSimpleMock.mockResolvedValue(
 				createAssistantResponse("adaptive summary", { cost: 0.6 }),
@@ -665,7 +699,7 @@ describe("custom-compaction", () => {
 			customCompaction(pi);
 
 			const result = await getCompactionHandler(pi)(
-				createCompactionEvent(),
+				createCompactionEvent(undefined, undefined, true),
 				session.ctx,
 			);
 
@@ -682,30 +716,23 @@ describe("custom-compaction", () => {
 			});
 			expect(completeSimpleMock).toHaveBeenCalledTimes(1);
 			const [, context, options] = completeSimpleMock.mock.calls[0] ?? [];
-			const text = requestText(context);
-			expect(text.indexOf("previous summary")).toBeLessThan(
-				text.indexOf("old question"),
-			);
-			expect(text.indexOf("old question")).toBeLessThan(
-				text.indexOf("split turn"),
-			);
+			const normalized = normalizeContext(context);
+			expect(normalized.messages.map((message) => message.role)).toEqual([
+				"system",
+				"user",
+			]);
+			expect(getCurrentTools(normalized.messages)).toEqual([]);
 			expect(options).toMatchObject({
 				reasoning: "high",
 				sessionId: expect.stringMatching(AUXILIARY_SESSION_ID_PATTERN),
 			});
-			expect(pi.appendEntryCalls).toEqual([
-				{
-					customType: HELPER_API_COST_CUSTOM_TYPE,
-					data: { source: "custom-compaction", cost: 0.6 },
+			expect(pi.appendEntryCalls).toContainEqual({
+				customType: "custom-compaction-outcome",
+				data: {
+					kind: "success",
+					message: "compaction completed: direct summary, 1 model request",
 				},
-				{
-					customType: "custom-compaction-outcome",
-					data: {
-						kind: "success",
-						message: "compaction completed: direct summary, 1 model request",
-					},
-				},
-			]);
+			});
 			expect(pi.entryRenderers).toHaveLength(1);
 			expect(pi.entryRenderers[0]?.customType).toBe(
 				"custom-compaction-outcome",

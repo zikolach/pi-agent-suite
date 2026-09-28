@@ -3,12 +3,16 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type {
-	Api,
-	AssistantMessage,
-	Context,
-	Model,
-	SimpleStreamOptions,
+import {
+	type Api,
+	type AssistantMessage,
+	type Context,
+	getCurrentTools,
+	type JsonObject,
+	type Model,
+	normalizeContext,
+	type SimpleStreamOptions,
+	type Tool,
 } from "@earendil-works/pi-ai";
 import {
 	createEventBus,
@@ -18,13 +22,13 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Box, Text, visibleWidth } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import consultAdvisor from "../../../pi-package/extensions/consult-advisor/index";
 import { COLLAPSED_ADVICE_PREVIEW_LINES } from "../../../pi-package/extensions/consult-advisor/rendering";
 import contextProjection from "../../../pi-package/extensions/context-projection/index";
 import mainAgentSelection from "../../../pi-package/extensions/main-agent-selection/index";
 import { AVAILABLE_SUBAGENTS_PROMPT_OPENING_TAG } from "../../../pi-package/extensions/run-subagent/contracts";
 import subagents from "../../../pi-package/extensions/run-subagent/index";
-import { HELPER_API_COST_CUSTOM_TYPE } from "../../../pi-package/shared/helper-api-cost";
 import { registerKnowledgeContextRuntime } from "../../../pi-package/shared/knowledge-runtime";
 import {
 	SUBAGENT_AGENT_ID_ENV,
@@ -32,9 +36,15 @@ import {
 	SUBAGENT_TOOL_PATTERNS_ENV,
 } from "../../../pi-package/shared/subagent-environment";
 import { getPackageToolPresentation } from "../../../pi-package/shared/tool-presentation/registry";
+import { USAGE_EVENT_RECORD_CHANNEL } from "../../../pi-package/shared/usage-events";
 
 const AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
 const AGENT_SUITE_DIR_ENV = "PI_AGENT_SUITE_DIR";
+const PRIMARY_TOOL: Tool = {
+	name: "primary_tool",
+	description: "Primary transcript tool.",
+	parameters: Type.Object({}),
+};
 /** Matches Pi-compatible UUIDv7 provider session identifiers. */
 const AUXILIARY_SESSION_ID_PATTERN =
 	/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -479,7 +489,7 @@ function createAdvisorToolCallMessage(
 function createToolCallMessage(
 	toolCallId: string,
 	toolName: string,
-	args: Record<string, unknown>,
+	args: JsonObject,
 	timestamp: number,
 ): AssistantMessage {
 	return {
@@ -1086,11 +1096,11 @@ describe("consult-advisor", () => {
 		});
 	});
 
-	test("calls advisor model with prompt, sanitized transcript, tools disabled, and debug payload", async () => {
-		// Purpose: valid config must call completeSimple with an isolated session, advisor prompt, transcript, and no tools.
-		// Input and expected output: the request has a Pi-compatible UUIDv7 and excludes the pending advisor call.
+	test("calls advisor model with isolated transcript, tools disabled, and debug payload", async () => {
+		// Purpose: advisor input must keep ordinary replay order without inheriting primary system state or tools.
+		// Input and expected output: a primary system tool update plus conversation becomes a tool-less auxiliary transcript and excludes the pending call.
 		// Edge case: debug payload path is resolved relative to consult-advisor.json directory.
-		// Dependencies: temp config, temp prompt, fake model registry, fake completion function, fake session entries.
+		// Dependencies: Pi transcript normalization, temp config, fake completion, and session entries.
 		await withIsolatedAgentDir(async (agentDir) => {
 			const promptFile = join(agentDir, "config", "advisor.md");
 			await mkdir(join(agentDir, "config"), { recursive: true });
@@ -1107,8 +1117,20 @@ describe("consult-advisor", () => {
 			const entries = [
 				{
 					type: "message",
-					id: "1",
+					id: "system",
 					parentId: null,
+					timestamp: "t",
+					message: {
+						role: "system",
+						content: "Primary system update.",
+						toolsAdded: [PRIMARY_TOOL],
+						timestamp: 0,
+					},
+				},
+				{
+					type: "message",
+					id: "1",
+					parentId: "system",
 					timestamp: "t",
 					message: { role: "user", content: "hello", timestamp: 1 },
 				},
@@ -1180,11 +1202,20 @@ describe("consult-advisor", () => {
 			expect(completion.calls[0]?.options?.sessionId).not.toBe(
 				"consult-advisor-test-session",
 			);
-			expect(completion.calls[0]?.context.systemPrompt).toBe("Advisor prompt");
-			expect(completion.calls[0]?.context.tools).toEqual([]);
-			const advisorMessages = JSON.stringify(
-				completion.calls[0]?.context.messages,
-			);
+			const context = completion.calls[0]?.context;
+			if (context === undefined) {
+				throw new Error("Expected advisor completion context");
+			}
+			const normalized = normalizeContext(context);
+			expect(normalized.messages.map((message) => message.role)).toEqual([
+				"system",
+				"user",
+				"assistant",
+				"toolResult",
+				"user",
+			]);
+			expect(getCurrentTools(normalized.messages)).toEqual([]);
+			const advisorMessages = JSON.stringify(context.messages);
 			expect(advisorMessages).toContain("old advisor result");
 			expect(advisorMessages).toContain("old-call");
 			expect(advisorMessages).not.toContain("current pending result");
@@ -1257,6 +1288,10 @@ describe("consult-advisor", () => {
 				},
 			]);
 			const pi = createExtensionApiFake();
+			const usageRequests: Array<{ source?: string }> = [];
+			pi.events.on(USAGE_EVENT_RECORD_CHANNEL, (request) => {
+				usageRequests.push(request as { source?: string });
+			});
 			const ctx = createContext([createModel("openai", "advisor")]);
 			consultAdvisor(pi, { completeSimple: completion.completeSimple });
 
@@ -1266,15 +1301,9 @@ describe("consult-advisor", () => {
 				content: [{ type: "text", text: "advisor recovered" }],
 			});
 			expect(completion.calls).toHaveLength(2);
-			expect(pi.appendEntryCalls).toEqual([
-				{
-					customType: HELPER_API_COST_CUSTOM_TYPE,
-					data: { source: "consult-advisor", cost: 0.2 },
-				},
-				{
-					customType: HELPER_API_COST_CUSTOM_TYPE,
-					data: { source: "consult-advisor", cost: 0.3 },
-				},
+			expect(usageRequests.map(({ source }) => source)).toEqual([
+				"consult-advisor",
+				"consult-advisor",
 			]);
 		});
 	});
@@ -1348,14 +1377,10 @@ describe("consult-advisor", () => {
 		});
 	});
 
-	test("replays persisted context projection state before calling the advisor", async () => {
-		// Purpose: advisor input must match the projected task state when context-projection has recorded omitted tool results.
-		// Input and expected output: valid projection config plus persisted state replaces old tool output with the recorded replacement text.
-		// Edge case: the current pending consult_advisor call is still removed after projection replay.
-		// Dependencies: temp context-projection config, fake model registry, fake completion function, and fake session entries.
+	test("replays Pi-edited history before calling the advisor", async () => {
 		await withIsolatedAgentDir(async (agentDir) => {
 			await writeProjectionConfig(agentDir, { enabled: true });
-			const replacementText = "[projected old output]";
+			const replacementText = "edited old output";
 			const model = createModel("openai", "advisor");
 			const completion = createCompletionFake();
 			const pi = createExtensionApiFake();
@@ -1388,7 +1413,14 @@ describe("consult-advisor", () => {
 						timestamp: 3,
 					},
 				},
-				createProjectionStateEntry("4", "3", replacementText, "3"),
+				{
+					type: "context_edit",
+					id: "4",
+					parentId: "3",
+					timestamp: "t",
+					targetId: "3",
+					replacement: { content: replacementText },
+				} as SessionEntry,
 				{
 					type: "message",
 					id: "5",
@@ -1407,13 +1439,28 @@ describe("consult-advisor", () => {
 			await executeConsult(pi, ctx, "Should we proceed?");
 
 			expect(completion.calls).toHaveLength(1);
-			const advisorMessages = JSON.stringify(
-				completion.calls[0]?.context.messages,
-			);
-			expect(advisorMessages).toContain(replacementText);
-			expect(advisorMessages).not.toContain("old full tool output");
-			expect(advisorMessages).not.toContain("current question");
-			expect(advisorMessages).not.toContain("call-1");
+			const advisorContext = completion.calls[0]?.context;
+			if (advisorContext === undefined) {
+				throw new Error("Expected advisor completion context");
+			}
+			const normalized = normalizeContext(advisorContext);
+			expect(normalized.messages.map((message) => message.role)).toEqual([
+				"system",
+				"user",
+				"assistant",
+				"toolResult",
+				"user",
+			]);
+			expect(getCurrentTools(normalized.messages)).toEqual([]);
+			expect(normalized.messages[2]).toMatchObject({
+				role: "assistant",
+				content: [{ type: "toolCall", id: "old-tool", name: "bash" }],
+			});
+			expect(normalized.messages[3]).toMatchObject({
+				role: "toolResult",
+				toolCallId: "old-tool",
+				content: [{ type: "text", text: replacementText }],
+			});
 		});
 	});
 

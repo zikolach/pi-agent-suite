@@ -15,6 +15,7 @@ import {
 	doesAuxiliaryLlmInputFitContextWindow,
 	getAuxiliaryLlmResponseText,
 	resolveAuxiliaryLlmRuntime,
+	withoutSystemMessages,
 } from "../../shared/auxiliary-llm";
 import { replayContextProjection } from "../../shared/context-projection";
 import { countKnowledgeTextTokens } from "../../shared/context-size";
@@ -81,6 +82,7 @@ interface KnowledgeAlgorithmOptions {
 		operation: KnowledgeAccumulationOperation,
 		sizeTarget?: string,
 	) => void;
+	readonly onComplete?: (message: AssistantMessage) => void;
 }
 
 /** Reports whether an accumulation performed a complete knowledge replacement. */
@@ -128,7 +130,7 @@ export async function runLocalKnowledgeAccumulation(
 	});
 	const extractionRequest: ExtractionRequest = {
 		knowledgeBlock: renderKnowledgeBlock(options.snapshots),
-		source: formatSummarySource(convertToLlm(projected)),
+		source: formatSummarySource(convertToLlm(withoutSystemMessages(projected))),
 		taskPrompt: extraction.operation.taskPrompt,
 	};
 	const extracted = await extractKnowledge(
@@ -454,6 +456,7 @@ async function completeText(
 			operation.runtime,
 		),
 	);
+	options.onComplete?.(response);
 	throwIfCancelled(options.signal);
 	if (response.stopReason === "aborted") {
 		throw new Error("knowledge model request was cancelled");

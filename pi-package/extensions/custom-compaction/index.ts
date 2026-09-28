@@ -18,6 +18,7 @@ import type {
 import { Text } from "@earendil-works/pi-tui";
 import { buildActiveToolDefinitions } from "../../shared/active-tool-definitions";
 import { readSuiteConfigFileSync } from "../../shared/agent-suite-storage";
+import { withoutSystemMessages } from "../../shared/auxiliary-llm";
 import { createAuxiliaryLlmSessionId } from "../../shared/auxiliary-llm-session";
 import {
 	replayContextProjection,
@@ -27,7 +28,6 @@ import {
 	type CustomCompactionConfig,
 	readCustomCompactionConfig,
 } from "../../shared/custom-compaction-config";
-import { recordHelperApiCost } from "../../shared/helper-api-cost";
 import {
 	resolveThinkingLevel,
 	splitModelId,
@@ -37,6 +37,7 @@ import {
 	isReasoningLevel,
 	type ReasoningLevel,
 } from "../../shared/reasoning-levels";
+import { publishUsageEvent } from "../../shared/usage-events";
 import { resolveModelSettingsWithAliasesSync } from "../model-aliases/config";
 import {
 	type AdaptiveCompactionProgressEvent,
@@ -311,18 +312,22 @@ async function resolveProjectedContexts(
 	ctx: ExtensionContext,
 	progress: CompactionProgressReporter,
 ): Promise<ProjectedCompactionContexts> {
-	const [currentProjectedMainMessages, projectedRetainedMessages] =
-		await Promise.all([
-			replayContextProjection({
-				branchEntries: event.branchEntries,
-				cwd: ctx.cwd,
-			}),
-			replayRetainedContextProjection({
-				branchEntries: event.branchEntries,
-				firstKeptEntryId: event.preparation.firstKeptEntryId,
-				cwd: ctx.cwd,
-			}),
-		]);
+	const [replayedMainMessages, replayedRetainedMessages] = await Promise.all([
+		replayContextProjection({
+			branchEntries: event.branchEntries,
+			cwd: ctx.cwd,
+		}),
+		replayRetainedContextProjection({
+			branchEntries: event.branchEntries,
+			firstKeptEntryId: event.preparation.firstKeptEntryId,
+			cwd: ctx.cwd,
+		}),
+	]);
+	const currentProjectedMainMessages =
+		withoutSystemMessages(replayedMainMessages);
+	const projectedRetainedMessages = withoutSystemMessages(
+		replayedRetainedMessages,
+	);
 	const projectedToolResultSummaries = await projectCompactionSource({
 		pi,
 		event,
@@ -488,7 +493,7 @@ async function executeCompletion(
 		sessionId: request.requestId,
 		maxTokens: request.maxTokens,
 	});
-	recordHelperApiCost(pi, "custom-compaction", response);
+	publishUsageEvent(pi, "custom-compaction", response);
 	return response;
 }
 

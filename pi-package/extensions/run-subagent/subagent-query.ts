@@ -13,11 +13,12 @@ import {
 	doesAuxiliaryLlmInputFitContextWindow,
 	getAuxiliaryLlmResponseText,
 	resolveAuxiliaryLlmRuntime,
+	withoutSystemMessages,
 } from "../../shared/auxiliary-llm";
 import { replayPersistedContextProjection } from "../../shared/context-projection";
-import { recordHelperApiCost } from "../../shared/helper-api-cost";
 import { readKnowledgeBlock } from "../../shared/knowledge-runtime";
 import { isReasoningLevel } from "../../shared/reasoning-levels";
+import { publishUsageEvent } from "../../shared/usage-events";
 import { readCancellationError } from "./cancellation-reason";
 import type { SubagentQueryModelConfig } from "./entry-config";
 import { errorMessage } from "./error-message";
@@ -105,7 +106,7 @@ export async function executeSubagentQuery({
 		return { kind: "issue", issue: errorMessage(error) };
 	}
 
-	recordHelperApiCost(pi, "subagent-query", response);
+	publishUsageEvent(pi, "subagent-query", response);
 	if (signal?.aborted) {
 		throw readCancellationError(signal);
 	}
@@ -140,7 +141,7 @@ async function buildQueryContext({
 	readonly question: string;
 }): Promise<Context> {
 	const messages = convertToLlm(
-		replayPersistedContextProjection(branchEntries),
+		withoutSystemMessages(replayPersistedContextProjection(branchEntries)),
 	);
 	messages.push({
 		role: "user",

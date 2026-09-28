@@ -1,14 +1,21 @@
 import { describe, expect, test } from "bun:test";
-import type {
-	Api,
-	AssistantMessage,
-	Context,
-	Model,
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import {
+	type Api,
+	type AssistantMessage,
+	type Context,
+	getCurrentTools,
+	type Model,
+	normalizeContext,
 } from "@earendil-works/pi-ai";
 import type {
 	ExtensionContext,
 	SessionEntry,
 } from "@earendil-works/pi-coding-agent";
+import { createTempDir } from "../../../test/support/temp-dir.ts";
+import { replayContextProjection } from "../../shared/context-projection";
 import type { KnowledgeSnapshots } from "../../shared/knowledge-runtime";
 import {
 	runGlobalKnowledgeAccumulation,
@@ -23,6 +30,41 @@ import {
 	type KnowledgeTarget,
 } from "./owner";
 import { createBranchPaths, createProjectPaths } from "./paths";
+
+const AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
+const AGENT_SUITE_DIR_ENV = "PI_AGENT_SUITE_DIR";
+
+/** Runs a test with isolated projection configuration. */
+async function withIsolatedProjectionConfig<T>(
+	action: () => Promise<T>,
+): Promise<T> {
+	const previousAgentDir = process.env[AGENT_DIR_ENV];
+	const previousSuiteDir = process.env[AGENT_SUITE_DIR_ENV];
+	const agentDir = createTempDir("pi-knowledge-projection-");
+	process.env[AGENT_DIR_ENV] = agentDir.path;
+	delete process.env[AGENT_SUITE_DIR_ENV];
+	try {
+		await mkdir(join(agentDir.path, "config"), { recursive: true });
+		await writeFile(
+			join(agentDir.path, "config", "context-projection.json"),
+			JSON.stringify({ enabled: false }),
+		);
+		return await action();
+	} finally {
+		restoreEnv(AGENT_DIR_ENV, previousAgentDir);
+		restoreEnv(AGENT_SUITE_DIR_ENV, previousSuiteDir);
+		agentDir.remove();
+	}
+}
+
+/** Restores one test-scoped environment variable. */
+function restoreEnv(key: string, value: string | undefined): void {
+	if (value === undefined) {
+		delete process.env[key];
+		return;
+	}
+	process.env[key] = value;
+}
 
 /** One deterministic model with enough context for protocol tests. */
 const MODEL = {
@@ -172,6 +214,11 @@ function createOptions(options: {
 	readonly reportProgress?: Parameters<
 		typeof runLocalKnowledgeAccumulation
 	>[0]["reportProgress"];
+	readonly replay?: Parameters<
+		typeof runLocalKnowledgeAccumulation
+	>[0]["replay"];
+	readonly branchEntries?: readonly SessionEntry[];
+	readonly completed?: AssistantMessage[];
 }): Parameters<typeof runLocalKnowledgeAccumulation>[0] {
 	const projectPaths = createProjectPaths("/catalog", "project-a-digest");
 	const branchPaths = createBranchPaths(projectPaths, "feature/a");
@@ -190,16 +237,18 @@ function createOptions(options: {
 		branchPaths,
 		identityMetadata: IDENTITY_METADATA,
 		snapshots: options.snapshots,
-		branchEntries: [
-			{
-				type: "custom",
-				id: "source-entry",
-				parentId: null,
-				timestamp: "t",
-				customType: "source",
-				data: {},
-			},
-		] as SessionEntry[],
+		branchEntries:
+			options.branchEntries ??
+			([
+				{
+					type: "custom",
+					id: "source-entry",
+					parentId: null,
+					timestamp: "t",
+					customType: "source",
+					data: {},
+				},
+			] as SessionEntry[]),
 		loadedSkillRoots: ["/skills"],
 		currentThinking: "high",
 		completeSimple: async (_model, context) => {
@@ -213,32 +262,87 @@ function createOptions(options: {
 			return response(text, stopReason);
 		},
 		signal: undefined,
-		replay: async ({ branchEntries }) => {
-			expect(branchEntries).toEqual([
-				{
-					type: "custom",
-					id: "source-entry",
-					parentId: null,
-					timestamp: "t",
-					customType: "source",
-					data: {},
-				},
-			]);
-			return [
-				{
-					role: "user",
-					content: "projected current branch",
-					timestamp: 1,
-				},
-			];
-		},
+		replay:
+			options.replay ??
+			(async ({ branchEntries }) => {
+				expect(branchEntries).toEqual([
+					{
+						type: "custom",
+						id: "source-entry",
+						parentId: null,
+						timestamp: "t",
+						customType: "source",
+						data: {},
+					},
+				]);
+				return [
+					{
+						role: "user",
+						content: "projected current branch",
+						timestamp: 1,
+					},
+				];
+			}),
 		...(options.reportProgress === undefined
 			? {}
 			: { reportProgress: options.reportProgress }),
+		...(options.completed === undefined
+			? {}
+			: {
+					onComplete: (message: AssistantMessage) =>
+						options.completed?.push(message),
+				}),
 	};
 }
 
 describe("knowledge accumulation algorithms", () => {
+	test("publishes each accepted knowledge model response", async () => {
+		// Purpose: each completed knowledge request must expose its full assistant usage once.
+		// Input and expected output: one accepted extraction response reports that same assistant message.
+		// Edge case: a NOT_FOUND domain result is still a completed consumed model response.
+		// Dependencies: deterministic completion and injected completion observer.
+		const completed: AssistantMessage[] = [];
+		const options = createOptions({
+			owner: new RecordingOwner(),
+			snapshots: { global: null, local: null },
+			outputs: ["NOT_FOUND"],
+			contexts: [],
+			completed,
+		});
+
+		await runLocalKnowledgeAccumulation(options);
+
+		expect(completed).toHaveLength(1);
+		expect(completed[0]).toMatchObject({
+			provider: MODEL.provider,
+			model: MODEL.id,
+			usage: expect.any(Object),
+		});
+	});
+
+	test("publishes a complete failed knowledge response before rejecting it", async () => {
+		// Purpose: a returned provider-error response with complete usage must remain observable.
+		// Input and expected output: one failed response is reported once and the algorithm still rejects with its domain error.
+		// Edge case: the returned error is final and is not a hidden retry attempt.
+		// Dependencies: deterministic failed completion and injected completion observer.
+		const completed: AssistantMessage[] = [];
+		const options = createOptions({
+			owner: new RecordingOwner(),
+			snapshots: { global: null, local: null },
+			outputs: ["provider failure"],
+			stopReasons: ["error"],
+			contexts: [],
+			completed,
+		});
+
+		await expect(runLocalKnowledgeAccumulation(options)).rejects.toThrow(
+			"knowledge model request failed",
+		);
+		expect(completed).toHaveLength(1);
+		expect(completed[0]?.stopReason).toBe("error");
+		expect(completed[0]?.usage).toEqual(response("x").usage);
+	});
+
 	/**
 	 * Proves exact NOT_FOUND ends local extraction without merge or storage changes.
 	 * Inputs and expected outputs: projected branch context is wrapped as explicit summary source in one extraction user message.
@@ -274,6 +378,151 @@ describe("knowledge accumulation algorithms", () => {
 			"</summary_source>",
 		);
 		expect(owner.events).toEqual([]);
+	});
+
+	test("isolates replayed system state before local extraction", async () => {
+		// Purpose: local accumulation must remove replayed system state before summary serialization.
+		// Input and expected output: one system record and one user record produce a tool-less auxiliary request with dedicated-system and user roles.
+		// Edge case: reading removed system content would show that it entered auxiliary assembly.
+		// Dependencies: injected replay, Pi transcript normalization, and the extraction completion seam.
+		const contexts: Context[] = [];
+		let systemContentReads = 0;
+		const primarySystem: AgentMessage = {
+			role: "system",
+			get content() {
+				systemContentReads += 1;
+				return "Primary system state.";
+			},
+			timestamp: 0,
+		};
+		const options = createOptions({
+			owner: new RecordingOwner(),
+			snapshots: { global: null, local: null },
+			outputs: ["NOT_FOUND"],
+			contexts,
+			replay: async () => [
+				primarySystem,
+				{ role: "user", content: "Ordinary source.", timestamp: 1 },
+			],
+		});
+
+		await runLocalKnowledgeAccumulation(options);
+
+		expect(systemContentReads).toBe(0);
+		const context = contexts[0];
+		if (context === undefined) {
+			throw new Error("Expected knowledge completion context");
+		}
+		const normalized = normalizeContext(context);
+		expect(normalized.messages.map((message) => message.role)).toEqual([
+			"system",
+			"user",
+		]);
+		expect(getCurrentTools(normalized.messages)).toEqual([]);
+	});
+
+	test("converts Pi-edited history into isolated knowledge context", async () => {
+		await withIsolatedProjectionConfig(async () => {
+			const contexts: Context[] = [];
+			let replayedRoles: string[] = [];
+			const assistantMessage: AgentMessage = {
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "call", name: "bash", arguments: {} },
+				],
+				api: "test-api",
+				provider: "test-provider",
+				model: "test-model",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						total: 0,
+					},
+				},
+				stopReason: "toolUse",
+				timestamp: 2,
+			};
+			const branchEntries = [
+				{
+					type: "message",
+					id: "user",
+					parentId: null,
+					timestamp: "t1",
+					message: { role: "user", content: "source", timestamp: 1 },
+				},
+				{
+					type: "message",
+					id: "assistant",
+					parentId: "user",
+					timestamp: "t2",
+					message: assistantMessage,
+				},
+				{
+					type: "message",
+					id: "tool",
+					parentId: "assistant",
+					timestamp: "t3",
+					message: {
+						role: "toolResult",
+						toolCallId: "call",
+						toolName: "bash",
+						content: [{ type: "text", text: "raw" }],
+						isError: false,
+						timestamp: 3,
+					},
+				},
+				{
+					type: "context_edit",
+					id: "omit",
+					parentId: "tool",
+					timestamp: "t4",
+					targetId: "user",
+					replacement: null,
+				},
+				{
+					type: "context_edit",
+					id: "replace",
+					parentId: "omit",
+					timestamp: "t5",
+					targetId: "tool",
+					replacement: { content: "edited" },
+				},
+			] as SessionEntry[];
+			const options = createOptions({
+				owner: new RecordingOwner(),
+				snapshots: { global: null, local: null },
+				outputs: ["NOT_FOUND"],
+				contexts,
+				branchEntries,
+				replay: async (replayOptions) => {
+					const messages = await replayContextProjection(replayOptions);
+					replayedRoles = messages.map((message) => message.role);
+					return messages;
+				},
+			});
+
+			await runLocalKnowledgeAccumulation(options);
+
+			expect(replayedRoles).toEqual(["assistant", "toolResult"]);
+			const context = contexts[0];
+			if (context === undefined) {
+				throw new Error("Expected knowledge completion context");
+			}
+			const normalized = normalizeContext(context);
+			expect(normalized.messages.map((message) => message.role)).toEqual([
+				"system",
+				"user",
+			]);
+			expect(getCurrentTools(normalized.messages)).toEqual([]);
+		});
 	});
 
 	/**
