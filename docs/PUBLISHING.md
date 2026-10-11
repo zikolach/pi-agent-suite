@@ -40,7 +40,7 @@ Update all Pi development packages to one explicit version:
 make pi-update PI_VERSION=0.80.6
 ```
 
-The update target checks that all four packages provide the requested version, writes exact versions to root `package.json` and `bun.lock`, reinstalls `pi-package/` nested dependencies so `pi-package/node_modules/` matches the root versions, runs `bun run verify`, and prints the version of the repository-local Pi executable.
+The update target checks that all four packages provide the requested version, writes exact versions to the root development dependencies and published-package peer dependencies, regenerates the Bun and npm lock files, runs `bun run verify`, and prints the version of the repository-local Pi executable.
 
 Review the upstream Pi changes and the resulting repository diff before committing. The target does not update the globally installed Pi.
 
@@ -68,7 +68,7 @@ make release-minor
 make release-major
 ```
 
-The command runs validation, repository audit, and both consumer installation checks before changing the version. Only after all checks pass does it run `npm version` in `pi-package/`. A failed check leaves the version unchanged. Package staging and archives stay in system temporary directories; release checks do not write `pi-package/README.md`.
+The command installs locked dependencies in the repository root and in `pi-package/`, then runs validation, repository audit, and both consumer installation checks before changing the version. Only after all checks pass does it run `npm version` in `pi-package/`. A failed check leaves the version unchanged. Package staging and archives stay in system temporary directories; release checks do not write `pi-package/README.md`.
 
 Print the remaining manual steps:
 

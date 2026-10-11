@@ -6,6 +6,7 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
+	ExtensionToolContext,
 	RegisteredCommand,
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -27,6 +28,13 @@ import {
 } from "./metadata-cache.ts";
 
 const FILES_READ_TOOL_NAME = "files_read";
+const TOOL_CONTEXT = {
+	...({} as ExtensionContext),
+	tools: [],
+	async executeTool() {
+		throw new Error("Unexpected nested tool call");
+	},
+} satisfies ExtensionToolContext;
 const previousSuiteDir = process.env[AGENT_SUITE_DIR_ENV];
 const THEME = {
 	bold: (value: string) => value,
@@ -47,6 +55,8 @@ const RESULT_RENDER_CONTEXT: RenderResultContext = {
 	isPartial: false,
 	expanded: false,
 	showImages: false,
+	durationMs: undefined,
+	outputPad: 1,
 	isError: false,
 };
 
@@ -479,7 +489,7 @@ describe("mcp-wrapper extension", () => {
 			{ path: "/tmp/a" },
 			undefined,
 			undefined,
-			{} as ExtensionContext,
+			TOOL_CONTEXT,
 		);
 
 		expect(callResults).toEqual([
@@ -611,7 +621,7 @@ describe("mcp-wrapper extension", () => {
 			{ name: "search-suite" },
 			undefined,
 			undefined,
-			{} as ExtensionContext,
+			TOOL_CONTEXT,
 		);
 
 		expect(discoveryCalls).toBe(2);

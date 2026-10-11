@@ -12,6 +12,14 @@ The adapter passes cancellation and timeout options as the second `callTool` arg
 
 The protocol tests use the real client with a local stdio fixture and fake HTTP fetch responses. Consumer installation and upgrade audits are separate release checks described in [Publishing](../PUBLISHING.md#consumer-installation-checks).
 
+## Connection recovery and errors
+
+When the SDK reports that a tool request was rejected before being sent because the connection is closed, the wrapper discards the affected client and makes one attempt to reconnect and repeat the call. This applies to all configured MCP servers. Concurrent calls to one server share the replacement connection.
+
+If recovery fails, the error includes the server key, tool name, and failure reason. Requests already sent, server errors, and timeouts are returned without automatic repetition because the server may have executed the operation.
+
+Timeout errors include the operation and configured duration, for example `MCP tool files/read timed out after 120 seconds`. The underlying exception is retained in the error's `cause`.
+
 ## Configuration file
 
 By default, place the configuration at `agent-suite/mcp-wrapper/config.json`. If the file is missing, no MCP tools are registered.
@@ -82,6 +90,14 @@ Collapsed call arguments and text results are normalized into one logical line b
 - Complete JSON text is normalized inside decoded string tokens. Non-string JSON lexemes, literal backslashes, paths, regular expressions, and visible Unicode remain unchanged.
 
 Expanded calls retain their complete serialized arguments. Expanded results retain the original MCP text and use Pi Markdown rendering.
+
+## Result size
+
+The model receives at most 2000 lines or 50 KB of MCP text, as with Pi's `read` tool:
+
+- A JSON object or array larger than 50 KB is formatted with one value per line. Smaller JSON text stays unchanged.
+- When text exceeds the limit, the model receives its start, the range of shown lines, the offset of the next line, and the path of a temporary file with the complete text. The model reads the rest of this file with `read`.
+- A single line longer than 50 KB is cut at its first 50 KB.
 
 `settings.timeouts` parameters:
 

@@ -100,9 +100,45 @@ Configuration and description files are read once while the extension runtime st
 
 The root agent has depth `0`. With the default `maxDepth` of `1`, the root can start direct children, but those children cannot delegate further.
 
+## Additional extensions
+
+Configure child extension loading in `~/.pi/agent/agent-suite/agent-selection/config.json`. The suite root follows `PI_AGENT_SUITE_DIR` when set. This is separate from `run-subagent/config.json`.
+
+```json
+{
+  "subagents": {
+    "extensions": {
+      "mode": "explicit",
+      "include": [
+        "builtin:codemode",
+        "/absolute/path/to/custom-extension.ts"
+      ]
+    }
+  }
+}
+```
+
+| Mode | Child extension loading |
+| --- | --- |
+| `none` | Only `pi-package`. User, project, and built-in extension discovery is disabled. |
+| `all` | `pi-package` plus extensions enabled by ordinary Pi user and project settings. |
+| `explicit` | `pi-package` plus only the sources listed in `include`. Automatic discovery is disabled. |
+
+An absent file, `subagents` section, or `extensions` section uses `all`. This permits ordinary Pi extension settings without an implicit package-only restriction. Select `none` to require package-only workers.
+
+`include` is required and permitted only in `explicit` mode. It accepts file paths, directory paths, and `builtin:<name>` identifiers using Pi's `-e` semantics. Relative paths resolve against the child's project working directory. Entries must be non-whitespace strings; an empty array loads no additional extensions. Built-in extensions such as `builtin:codemode` are additional extensions and must be listed in `explicit` mode.
+
+The top-level object accepts `enabled` and `subagents`. `enabled` retains its main-agent selection meaning. The `subagents` object accepts only `extensions`, which accepts only `mode` and the explicit-mode `include` list. Invalid JSON, unreadable files, unknown keys, or invalid values reject run-subagent extension loading with a diagnostic identifying the configuration file. This setting has no legacy configuration fallback.
+
+Extension loading and tool permission are separate. The agent's `tools` policy still restricts its final tool set. `defaultTools` and enable-tools can activate a registered tool, but neither can supply an extension disabled by the loading mode.
+
+The policy is read once during extension initialization. Restart Pi to apply changes. New direct children, nested children, and resumed terminal sessions use the policy. Steering an active child reuses its already loaded extensions. Other package child launchers are outside this setting.
+
 ## Callable agents and tool policy
 
 Callable agents come from the shared agent registry documented in [main-agent-selection](main-agent-selection.md). Global definitions under `~/.pi/agent/agent-suite/agent-selection/agents` are extended or replaced by definitions under `<cwd>/.pi/agents`.
+
+Registry failures produce [warnings](main-agent-selection.md#registry-warnings) while startup continues. `run-subagent` uses the shared reporter even when loaded alone, so each distinct warning appears once per session.
 
 A project agent definition supplies the child prompt, model, thinking level, tool patterns, workflow policy, and callable subagents. Each child resolves its own tool patterns against its complete runtime tool catalog. The caller's active tool list does not become the child's tool list.
 
@@ -215,6 +251,8 @@ Tool presentation follows three paths:
 - Package tools publish their exact call, result, and shell presentation through Pi's shared extension event bus. The management pane resolves these presentations by tool name, independent of extension load order and Jiti module isolation. This covers the four Subagents tools, MCP wrapper tools, `consult_advisor`, and `convene_council`.
 - Other tool names use the universal presentation: the JSON call preview starts on the tool-name row and occupies at most two visual lines; collapsed results occupy at most five visual lines and include a hidden-line count with the configured expansion key; expanded results use full Markdown; failures use error styling; and Pi supplies the normal tool shell.
 - Collapsed arbitrary text uses the same whitespace, JSON-string, and terminal-control normalization as MCP tool previews. Expanded result text remains unchanged.
+
+Each overlay reads Pi's effective `outputPad` setting when it opens and applies that horizontal padding to its tool components. Reopening the overlay reads the setting again. The pane passes recorded tool durations to Pi's native renderer in compact and expanded views. For example, a result with `durationMs: 2500` displays `Took 2.5s`; older results without a recorded duration retain Pi's presentation without timing.
 
 `Ctrl+O`, the default `app.tools.expand` binding, toggles all tool and custom-message expansion states regardless of focus. Each overlay samples Pi's current main-conversation tool-expansion state when that overlay opens. Toggling expansion inside the overlay changes only that open overlay and does not change the main conversation.
 

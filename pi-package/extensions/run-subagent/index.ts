@@ -9,6 +9,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Key } from "@earendil-works/pi-tui";
 import { isAbortedAgentRun } from "../../shared/agent-end-state";
+import { getAgentRegistryWarningReporter } from "../../shared/agent-registry-warnings";
 import { getAgentRuntimeComposition } from "../../shared/agent-runtime-composition";
 import { getSuiteExtensionDir } from "../../shared/agent-suite-storage";
 import type { AuxiliaryLlmCompletion } from "../../shared/auxiliary-llm";
@@ -63,6 +64,7 @@ import {
 } from "./entry-config";
 import { readSubagentAgentId } from "./environment";
 import { errorMessage } from "./error-message";
+import { readSubagentExtensionArgs } from "./extension-config";
 import { materializeForkHierarchy } from "./fork-hierarchy";
 import { InvocationSupervisor } from "./invocation-supervisor";
 import { parseFeedback, parseJournalRecord } from "./journal-codec";
@@ -156,6 +158,7 @@ interface RuntimeState {
 	readonly resolveConfig: () => Promise<SubagentsConfig>;
 	readonly failures: Map<string, SubagentFailureDetails>;
 	readonly childStartupConfig: ChildStartupConfig;
+	readonly extensionArgs: readonly string[];
 	readonly recordChildStartupAttempt: ReturnType<
 		typeof createChildAuthStartupDiagnosticRecorder
 	>;
@@ -206,6 +209,7 @@ export default async function subagents(
 			Promise.reject(new Error("subagent configuration is initializing")),
 		failures: new Map(),
 		childStartupConfig,
+		extensionArgs: readSubagentExtensionArgs(),
 		recordChildStartupAttempt,
 		config: undefined,
 		initialization: undefined,
@@ -298,6 +302,7 @@ async function handleSessionStart(
 	event: SessionStartEvent,
 	ctx: ExtensionContext,
 ): Promise<void> {
+	getAgentRegistryWarningReporter(pi, ctx);
 	const config = await state.resolveConfig();
 	state.config = config;
 	if (!config.enabled) {
@@ -773,11 +778,15 @@ async function executeTool(
 async function createRootRuntime(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
-	state: Pick<RuntimeState, "childStartupConfig" | "recordChildStartupAttempt">,
+	state: Pick<
+		RuntimeState,
+		"childStartupConfig" | "recordChildStartupAttempt" | "extensionArgs"
+	>,
 ): Promise<RootRuntime> {
 	const owner = ownerFromContext(ctx);
 	const writer = createActiveWriter(pi, ctx, owner);
-	const agents = await loadCallableAgents(ctx.cwd);
+	const reportWarning = getAgentRegistryWarningReporter(pi, ctx);
+	const agents = await loadCallableAgents(ctx.cwd, reportWarning);
 	const bridge = new RootRuntimeBridge();
 	let supervisor: InvocationSupervisor | undefined;
 	const store = createRootSessionStore(bridge, () => supervisor);
@@ -796,6 +805,7 @@ async function createRootRuntime(
 		recoveries,
 		queryBranches,
 		childStartupConfig: state.childStartupConfig,
+		extensionArgs: state.extensionArgs,
 		recordChildStartupAttempt: state.recordChildStartupAttempt,
 		getCoordinator: () => requireCoordinator(coordinator),
 	});
@@ -849,6 +859,7 @@ function createRootSupervisor(options: {
 	readonly recoveries: RuntimeFailureRecoveryTracker;
 	readonly queryBranches: QueryBranchAccess;
 	readonly childStartupConfig: ChildStartupConfig;
+	readonly extensionArgs: readonly string[];
 	readonly recordChildStartupAttempt: ReturnType<
 		typeof createChildAuthStartupDiagnosticRecorder
 	>;
@@ -857,6 +868,7 @@ function createRootSupervisor(options: {
 	let supervisor: InvocationSupervisor;
 	supervisor = new InvocationSupervisor({
 		bridge: options.bridge,
+		extensionArgs: options.extensionArgs,
 		childStartupConfig: options.childStartupConfig,
 		recordChildStartupAttempt: options.recordChildStartupAttempt,
 		rootSessionId: options.ctx.sessionManager.getSessionId(),
